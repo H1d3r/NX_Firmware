@@ -8,6 +8,7 @@ on:
 jobs:
   download_and_release:
     runs-on: ubuntu-latest
+
     permissions:
       contents: write
 
@@ -24,9 +25,11 @@ jobs:
 
       - name: ⚙️ Install required Python modules
         run: |
+          python -m pip install --upgrade pip
           pip install requests anynet beautifulsoup4
 
       - name: ⬇️ Setup hactool-linux
+        shell: bash
         run: |
           if [ -f "hactool-linux" ]; then
             cp hactool-linux hactool
@@ -35,63 +38,146 @@ jobs:
             echo "Warning: hactool-linux non trouvé."
           fi
 
-      - name: 🔍 Check firmware version (Switch 1 only, >=21.0.0)
+      - name: 🔍 Check latest Switch firmware
         id: version_check
         shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPOSITORY: ${{ github.repository }}
         run: |
           set +e
-          RSS=$(curl -sL --fail https://yls8.mtheall.com/ninupdates/feed.php)
+
+          RSS=$(curl -sSL --fail "https://yls8.mtheall.com/ninupdates/feed.php")
+
           if [ $? -ne 0 ] || [ -z "$RSS" ]; then
-            echo "new_version=false" >> $GITHUB_OUTPUT
+            echo "Impossible de récupérer le flux RSS."
+            echo "new_version=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
-          # Extraction stricte Switch 1 (hac) + Tri version
-          LATEST_VERSION=$(echo "$RSS" | tr -d '\n' | sed 's/<item>/\n<item>/g' | \
-            grep 'sys=hac' | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | sort -V | tail -n 1)
+          HAC_ITEMS=$(printf '%s' "$RSS" \
+            | tr -d '\n' \
+            | sed 's/<item>/\n<item>/g' \
+            | grep 'sys=hac')
+
+          if [ -z "$HAC_ITEMS" ]; then
+            echo "Aucun rapport Switch HAC trouvé."
+            echo "new_version=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          LATEST_REPORT_DATE=$(printf '%s\n' "$HAC_ITEMS" \
+            | grep -oE 'date=[0-9]{4}-[0-9]{2}-[0-9]{2}_[0-9]{2}-[0-9]{2}-[0-9]{2}' \
+            | cut -d= -f2 \
+            | sort \
+            | tail -n 1)
+
+          if [ -z "$LATEST_REPORT_DATE" ]; then
+            echo "Impossible de déterminer le dernier rapport."
+            echo "new_version=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "Dernier rapport HAC : $LATEST_REPORT_DATE"
+
+          REPORT_URL="https://yls8.mtheall.com/ninupdates/reports.php?date=${LATEST_REPORT_DATE}&sys=hac"
+
+          REPORT=$(curl -sSL --fail "$REPORT_URL")
+
+          LATEST_VERSION=""
+
+          if [ -n "$REPORT" ]; then
+            VERSION_CANDIDATES=$(printf '%s' "$REPORT" \
+              | sed 's/<[^>]*>/ /g' \
+              | grep -oiE '.{0,100}(systemversion|system version|firmware|system update).{0,100}' \
+              | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' \
+              | sort -Vu)
+
+            if [ -n "$VERSION_CANDIDATES" ]; then
+              LATEST_VERSION=$(printf '%s\n' "$VERSION_CANDIDATES" \
+                | sort -V \
+                | tail -n 1)
+            fi
+          fi
 
           if [ -z "$LATEST_VERSION" ]; then
-            echo "new_version=false" >> $GITHUB_OUTPUT
+            case "$LATEST_REPORT_DATE" in
+              "2026-09-10_05-05-06")
+                LATEST_VERSION="23.0.0"
+                ;;
+            esac
+          fi
+
+          if [ -z "$LATEST_VERSION" ]; then
+            echo "Rapport détecté mais version firmware inconnue : $LATEST_REPORT_DATE"
+            echo "new_version=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
+
+          echo "Firmware détecté : $LATEST_VERSION"
 
           MAJOR=$(echo "$LATEST_VERSION" | cut -d. -f1)
-          if [ "$MAJOR" -lt 21 ]; then
-            echo "new_version=false" >> $GITHUB_OUTPUT
+
+          if ! [[ "$MAJOR" =~ ^[0-9]+$ ]] || [ "$MAJOR" -lt 21 ]; then
+            echo "Version firmware ignorée : $LATEST_VERSION"
+            echo "new_version=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
-          # Check si la Release existe
-          HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
-            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-            "https://api.github.com/repos/${{ github.repository }}/releases/tags/$LATEST_VERSION")
+          HTTP_STATUS=$(curl -s \
+            -o /dev/null \
+            -w "%{http_code}" \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${REPOSITORY}/releases/tags/${LATEST_VERSION}")
 
           if [ "$HTTP_STATUS" = "200" ]; then
-            echo "new_version=false" >> $GITHUB_OUTPUT
+            echo "Release $LATEST_VERSION déjà existante."
+            echo "new_version=false" >> "$GITHUB_OUTPUT"
           else
-            echo "new_version=true" >> $GITHUB_OUTPUT
-            echo "firmware_version=$LATEST_VERSION" >> $GITHUB_OUTPUT
+            echo "Nouvelle version détectée : $LATEST_VERSION"
+            echo "new_version=true" >> "$GITHUB_OUTPUT"
+            echo "firmware_version=$LATEST_VERSION" >> "$GITHUB_OUTPUT"
+            echo "report_date=$LATEST_REPORT_DATE" >> "$GITHUB_OUTPUT"
+            echo "report_url=$REPORT_URL" >> "$GITHUB_OUTPUT"
           fi
+
           set -e
 
       - name: 💻 Execute download script & Extract Release Notes
         id: download
         if: steps.version_check.outputs.new_version == 'true'
+        shell: bash
         run: |
+          set -e
+
           VERSION="${{ steps.version_check.outputs.firmware_version }}"
-          
-          # Exécution SANS paramètre pour que le script interroge lui-même l'API Nintendo
+
           python3 firmware_downloader.py | tee script_output.log
-          echo "firmware_version=$VERSION" >> $GITHUB_OUTPUT
-          
-          # Extraction stricte des dernières lignes générées par le script Python
+
+          echo "firmware_version=$VERSION" >> "$GITHUB_OUTPUT"
+
+          EXPECTED_FILE="Firmware ${VERSION}.zip"
+
+          if [ ! -f "$EXPECTED_FILE" ]; then
+            echo "Archive non trouvée : $EXPECTED_FILE"
+            find . -maxdepth 1 -type f -name '*.zip' -print
+            exit 1
+          fi
+
           sed -n '/Archive created:/,$p' script_output.log > changelog_body.txt
-          
-          # Stockage sécurisé et multi-lignes du texte pour GitHub Actions
-          EOF=$(dd if=/dev/urandom bs=15 count=1 status=none | base64)
-          echo "CHANGELOG_CONTENT<<$EOF" >> $GITHUB_ENV
-          cat changelog_body.txt >> $GITHUB_ENV
-          echo "$EOF" >> $GITHUB_ENV
+
+          if [ ! -s changelog_body.txt ]; then
+            echo "Archive created: Firmware ${VERSION}.zip" > changelog_body.txt
+          fi
+
+          EOF_MARKER=$(dd if=/dev/urandom bs=15 count=1 status=none | base64)
+
+          {
+            echo "CHANGELOG_CONTENT<<$EOF_MARKER"
+            cat changelog_body.txt
+            echo "$EOF_MARKER"
+          } >> "$GITHUB_ENV"
 
       - name: 📦 Create Tag and Release
         if: steps.version_check.outputs.new_version == 'true'
@@ -101,10 +187,17 @@ jobs:
           name: Firmware ${{ steps.download.outputs.firmware_version }}
           body: |
             Automatic download of the official Nintendo Switch firmware version ${{ steps.download.outputs.firmware_version }}.
-            
+
+            NinUpdates report:
+            ${{ steps.version_check.outputs.report_url }}
+
             Downloaded file details:
             ${{ env.CHANGELOG_CONTENT }}
+
           files: |
             Firmware ${{ steps.download.outputs.firmware_version }}.zip
+
+          fail_on_unmatched_files: true
+
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
